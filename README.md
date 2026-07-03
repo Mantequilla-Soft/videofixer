@@ -35,7 +35,7 @@ Requires `ffmpeg`/`ffprobe` on `PATH` (the `Dockerfile` installs it via `apk add
 
 | Variable | Purpose |
 |---|---|
-| `PORT` | HTTP port (default `3005`) |
+| `PORT` | HTTP port (default `3200`) |
 | `VIDEOFIXER_API_KEY` | Required by every route except `/health`, via `X-API-Key` |
 | `MONGODB_URI` | Same MongoDB deployment as `3speakembed` is fine — videofixer uses its own database |
 | `MONGODB_DATABASE` | videofixer's own DB (default `videofixer`) — never touches `embed-jobs`/`embed-video` directly, everything crosses via the `3speakembed` HTTP endpoints below |
@@ -75,11 +75,52 @@ The Hermes agent finalizes fixes (marks jobs complete/failed) with no human in t
 
 ## Deployment
 
-`Dockerfile` builds a `node:18-alpine` image with `ffmpeg` and `curl` (for the healthcheck) installed, matching `3SpeakEncoderNew`'s production image conventions.
+Production runs as a pm2-managed process on port `3200`, behind Nginx at `videofixer.3speak.tv`.
+
+### pm2
+
+`ecosystem.config.js` is checked into the repo (mirrors the pattern used by `supernodemonitor`/`activitytracker` on this box). It intentionally does **not** set `PORT` — that stays in `.env` as the single source of truth, read via `dotenv` at startup.
+
+```bash
+git clone https://github.com/Mantequilla-Soft/videofixer.git
+cd videofixer
+npm install
+cp .env.example .env    # fill in real values — see the table above
+npm run build
+
+pm2 start ecosystem.config.js
+pm2 save                 # persist the process list
+pm2 startup              # follow its printed instructions once, so pm2 survives a reboot
+```
+
+Adjust `cwd` in `ecosystem.config.js` if you clone somewhere other than `/home/meno/videofixer`. **`instances` must stay `1`** — the per-video encode lock (`EncodeService`'s in-process `Set`) isn't shared across pm2 cluster workers, so cluster mode would silently break the "one fix at a time per video" guarantee `/encode`'s `409` response depends on.
+
+To ship a change: `git pull && npm install && npm run build && pm2 restart videofixer`.
+
+Logs: `pm2 logs videofixer`, or directly at `~/.pm2/logs/videofixer-{out,error}.log`.
+
+### Nginx
+
+`videofixer.3speak.tv.nginx` is the starting server block — proxies to `127.0.0.1:3200` with generous timeouts (`/encode` is a long synchronous request: download + ffmpeg + IPFS upload can take minutes). Point DNS at the box, drop the file in, then let Certbot add HTTPS the same way it's done for the other `*.3speak.tv` sites here:
+
+```bash
+sudo cp videofixer.3speak.tv.nginx /etc/nginx/sites-available/videofixer.3speak.tv
+sudo ln -s /etc/nginx/sites-available/videofixer.3speak.tv /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+
+# once the videofixer.3speak.tv A record has propagated:
+sudo certbot --nginx -d videofixer.3speak.tv
+```
+
+Certbot rewrites the file in place to add the HTTPS server block, SSL directives, and an HTTP → HTTPS redirect — don't hand-edit `ssl_certificate` lines yourself.
+
+### Docker (alternative)
+
+`Dockerfile` builds a `node:18-alpine` image with `ffmpeg` and `curl` (for the healthcheck) installed, matching `3SpeakEncoderNew`'s production image conventions. Not what's actually deployed today (that's pm2, above), but kept in sync in case that changes.
 
 ```bash
 docker build -t videofixer .
-docker run -d --env-file .env -p 3005:3005 -v videofixer-work:/app/work videofixer
+docker run -d --env-file .env -p 3200:3200 -v videofixer-work:/app/work videofixer
 ```
 
 ## Verifying a change

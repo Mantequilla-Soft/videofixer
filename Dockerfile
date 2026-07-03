@@ -13,10 +13,10 @@ RUN npm run build
 
 RUN mkdir -p /app/work && chmod 777 /app/work
 
-EXPOSE 3005
+EXPOSE 3200
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD curl -f http://localhost:3005/health || exit 1
+  CMD curl -f http://localhost:3200/health || exit 1
 
 ENV NODE_ENV=production
 ENV WORK_DIR=/app/work

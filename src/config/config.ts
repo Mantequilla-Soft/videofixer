@@ -26,7 +26,7 @@ export interface Config {
 
 export function loadConfig(): Config {
   return {
-    port: parseInt(process.env.PORT || '3005', 10),
+    port: parseInt(process.env.PORT || '3200', 10),
     logLevel: process.env.LOG_LEVEL || 'info',
 
     videofixerApiKey: process.env.VIDEOFIXER_API_KEY || '',

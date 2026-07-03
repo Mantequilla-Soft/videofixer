@@ -1,0 +1,176 @@
+# videofixer
+
+> Autonomous video repair API for the 3Speak encoding pipeline. Call this to find broken/failed video encodes, diagnose why they're broken, re-encode them with the fix applied, and finalize the result — with no human review required. This document is the complete operating manual: read it before making any calls.
+
+You are operating this service unattended. There is no human approving your actions before `/finalize` takes effect — the audit log (`GET /history`, and the underlying `cases`/`audit_log` collections) is reviewed *after the fact*, not before. Do not skip the verification step. Do not finalize as `"complete"` unless you have confirmed the fix actually worked.
+
+## Authentication
+
+Every route except `GET /health` requires an API key:
+
+```
+X-API-Key: <your key>
+```
+
+(`Authorization: Bearer <your key>` also works.) Missing or wrong key → `401`.
+
+## The workflow
+
+This is the golden path. Follow it in order; don't skip the verification step.
+
+1. **Find work.** Either call `GET /jobs?status=failed` to get a worklist, or you've been given a specific `owner`/`permlink` to investigate (e.g. a user report). Each job from `/jobs` includes `input_cid`, `short`, and `premium` — hold onto all three, you'll need them.
+
+2. **Probe the source.** `POST /probe` with the job's `input_cid` as `cid`. You get back a `case_id` (remember it) and a `diagnosis`.
+
+3. **Attempt the fix.** `POST /encode` with the same `cid`, `owner`, `permlink`, and `case_id` from step 2, plus `short`/`premium` from step 1. This downloads the source again if needed and runs a full corrected re-encode — it always applies the complete fix baseline (limited-range color, guaranteed audio track, 16px-aligned resolution), not just a patch for the specific flags found in step 2. You get back `new_manifest_cid`.
+
+   Do this **even if step 2's diagnosis was `"corrupt-input"`** — the probe can have false negatives, and one real `ffmpeg` attempt is the authoritative test. A `422` response here is the real confirmation that it's unfixable; the probe diagnosis alone is not.
+
+4. **Verify the fix before trusting it.** `POST /probe` again, same `case_id`, but with `cid` set to a segment inside the new output: `{new_manifest_cid}/{profile}/{profile}_000.ts`, where `{profile}` is one of `action_taken.profiles_encoded` from step 3 (e.g. `480p`). Confirm the flags that were present in step 2 are now gone. This is a technical check (codecs, audio presence, alignment, decodability) — not a real player-rendered playback check, so it can't catch purely visual bugs, but it's exactly the class of thing being fixed here (mobile decoder compatibility, not visual artifacts).
+
+5. **Finalize.**
+   - Verification clean → `POST /finalize` with `status: "complete"` and `manifest_cid: new_manifest_cid`.
+   - `/encode` returned `422`, or verification still shows the flags → `POST /finalize` with `status: "failed"` and a clear `error`. **Do not finalize `"complete"` on an unverified or still-broken result** — that's the one mistake this whole workflow exists to prevent.
+
+6. Optionally, before diagnosing something unfamiliar, check `GET /history?diagnosis=...` or `error_contains=...` — it's a searchable record of every prior case, including what fix was applied and whether it worked. Use it to sanity-check your approach on a new case, not to skip steps.
+
+Carry the **same `case_id`** through steps 2→3→4→5 for one repair attempt — it links the whole story together in the audit trail. If you omit it, the server mints a fresh one at each stage rather than failing (so nothing you do ever goes unlogged), but the record for that video becomes harder to reconstruct afterward.
+
+**Concurrency**: only one fix runs at a time per video. If `/encode` returns `409`, a fix for that `owner`/`permlink` is already in progress — move on to the next job, don't retry in a tight loop.
+
+## Endpoints
+
+### `GET /health`
+No auth. `{ "status": "ok", "service": "videofixer" }`.
+
+### `GET /jobs?status=failed&limit=20`
+`status`: one of `pending | encoding | completed | failed` (default `failed`). `limit`: 1–100 (default 20).
+
+```json
+{
+  "jobs": [
+    {
+      "owner": "alice", "permlink": "abc123xy", "status": "failed",
+      "lastError": "ffmpeg exited 1: invalid data found when processing input",
+      "attemptCount": 2, "assignedWorker": null,
+      "premium": false, "short": false,
+      "input_cid": "QmXYZ...", "originalFilename": "my-video.mp4", "videoStatus": "failed",
+      "createdAt": "2026-06-30T10:00:00.000Z", "updatedAt": "2026-06-30T10:05:00.000Z",
+      "webhookReceivedAt": "2026-06-30T10:05:00.000Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+`input_cid` here is a **bare IPFS CID** (not a full URL) — pass it straight through to `/probe`/`/encode`'s `cid` field.
+
+### `GET /video/:permlink`
+No body. Returns the raw video document from 3speakembed (`owner`, `permlink`, `status`, `input_cid`, `manifest_cid`, `short`, etc.), or `404 { "error": "Video not found" }`.
+
+### `POST /probe`
+```json
+{ "cid": "QmXYZ...", "owner": "alice", "permlink": "abc123xy", "case_id": "optional-uuid" }
+```
+`cid` is required; it accepts a bare CID *or* a CID with a subpath (`{cid}/480p/480p_000.ts`) — both are appended to the configured IPFS gateway. `owner`/`permlink` are optional but should always be supplied when known (they drive case linkage and later `/history` lookups). `case_id` optional — omit on your first call for a video, carry forward afterward.
+
+```json
+{
+  "case_id": "b6e2...-uuid",
+  "cid": "QmXYZ...",
+  "probe": {
+    "codec": "h264", "pix_fmt": "yuvj420p", "color_range": "pc",
+    "resolution": { "width": 272, "height": 480 }, "alignment_ok": true,
+    "has_audio": false, "audio_codec": null,
+    "duration_seconds": 3.37, "corrupt": false, "ffprobe_error": null
+  },
+  "flags": ["missing-audio", "full-range-color"],
+  "diagnosis": "multiple-issues",
+  "fixable": true
+}
+```
+
+This always returns `200` — a download failure or unreadable file is itself a valid diagnostic result (`diagnosis: "corrupt-input"`, `fixable: false`, `probe.corrupt: true`), not a server error. A `500` here means videofixer itself broke, not that the video is bad.
+
+**Diagnosis values**: `no-issues-detected` · `corrupt-input` · `missing-audio` · `full-range-color` · `misaligned-resolution` · `multiple-issues` (more than one flag at once). Only `corrupt-input` sets `fixable: false`.
+
+### `POST /encode`
+```json
+{ "cid": "QmXYZ...", "owner": "alice", "permlink": "abc123xy", "case_id": "b6e2...-uuid", "short": false, "premium": false }
+```
+All fields required except `case_id`. `short`/`premium` must come from the `/jobs` listing (or `GET /video/:permlink` for `short` — `premium` is not available there) — they control quality-tier selection (`short` → 480p only; `premium` & non-short → up to 1080p/720p/480p filtered to source resolution; free & non-short → 480p only), matching the real encoder fleet's rules exactly so a repaired video doesn't silently change tier.
+
+Success (`200`):
+```json
+{
+  "case_id": "b6e2...-uuid",
+  "diagnosis": "multiple-issues",
+  "action_taken": {
+    "description": "Applied baseline correction: -pix_fmt yuv420p (limited range); injected silent AAC track (source had none); 16px-aligned scale + zeroed start PTS",
+    "ffmpeg_flags": ["[480p] -map 0:v:0 -map 1:a:0 ..."],
+    "profiles_encoded": ["480p"]
+  },
+  "new_manifest_cid": "QmNewDirCID...",
+  "encode_ms": 41230,
+  "upload_ms": 8210
+}
+```
+
+Failure modes:
+- `409 { "case_id": "...", "error": "A fix is already in progress for alice/abc123xy" }` — back off, don't retry immediately.
+- `422 { "case_id": "...", "error": "ffmpeg failed for 480p: ..." }` — ffmpeg genuinely could not process this input. Treat as unfixable; proceed straight to `/finalize` with `status: "failed"`.
+- `500` — internal videofixer error (e.g. upload to the hot node failed). Safe to retry once after a short delay.
+
+### `POST /finalize`
+```json
+{ "owner": "alice", "permlink": "abc123xy", "status": "complete", "manifest_cid": "QmNewDirCID...", "case_id": "b6e2...-uuid" }
+```
+or
+```json
+{ "owner": "alice", "permlink": "abc123xy", "status": "failed", "error": "ffmpeg could not decode input, likely truncated upload", "case_id": "b6e2...-uuid" }
+```
+`manifest_cid` is required when `status: "complete"`; `error` is required when `status: "failed"` — `400` otherwise. This calls 3speakembed's own completion webhook under the hood (the same one real encoders use), so it correctly updates both the job and video records in one call — there is no separate "update the video" step.
+
+```json
+{ "case_id": "b6e2...-uuid", "owner": "alice", "permlink": "abc123xy", "embed_response": { "success": true, "message": "Webhook processed successfully" } }
+```
+`502` means videofixer couldn't reach 3speakembed itself (transient — retry after a delay); it does not mean your fix was bad.
+
+### `GET /history?diagnosis=&codec=&error_contains=&owner=&permlink=&since=&until=&limit=20&skip=0&full=false`
+All query params optional. Returns cases sorted newest-first:
+```json
+{
+  "count": 3,
+  "cases": [
+    {
+      "case_id": "...", "owner": "alice", "permlink": "abc123xy",
+      "trigger": "reported", "status": "finalized", "created_at": "2026-06-30T10:10:00.000Z",
+      "diagnosis": "multiple-issues", "flags": ["missing-audio", "full-range-color"],
+      "action_taken": { "description": "...", "ffmpeg_flags": [...], "profiles_encoded": ["480p"] },
+      "new_manifest_cid": "QmNewDirCID...", "finalize_status": "complete", "result": "fixed"
+    }
+  ]
+}
+```
+Pass `full=true` to get the complete case documents (including raw `ffprobe` output) instead of the summary shape above.
+
+## Status code summary
+
+| Code | Meaning | What to do |
+|---|---|---|
+| 200 | Success (includes `/probe` on a corrupt/unreadable input — that's a valid result, not an error) | Continue the workflow |
+| 400 | Your request was malformed | Check the `details` field, fix the request — don't retry as-is |
+| 401 | Missing/invalid API key | Check credentials, don't retry the same way |
+| 404 | Video not found (`GET /video/:permlink` only) | The permlink doesn't exist — verify it |
+| 409 | A fix is already running for this video | Skip for now, it'll reappear in `/jobs` if still unresolved |
+| 422 | `ffmpeg` genuinely failed on this input (`/encode` only) | Treat as unfixable, finalize as `"failed"` |
+| 500 | Internal videofixer error | Transient — safe to retry once after a short delay |
+| 502 | videofixer couldn't reach 3speakembed | Transient — retry after a delay |
+
+## What not to do
+
+- Don't finalize `"complete"` without a clean verification probe on the actual new output.
+- Don't guess `premium`/`short` — get them from `/jobs` (or omit `premium` handling entirely for a video you don't have job data for; ask rather than assume free-tier).
+- Don't treat `corrupt-input` from `/probe` as final — let `/encode`'s real `ffmpeg` attempt (422 or success) be the actual verdict.
+- Don't hammer `/encode` on `409` — it means someone (possibly a previous run of you) is already on it.
+- Don't call MongoDB or 3speakembed directly — you don't have those credentials, and you're not supposed to; everything goes through this API.

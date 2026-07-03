@@ -2,7 +2,7 @@ module.exports = {
   apps: [{
     name: 'videofixer',
     script: './dist/index.js',
-    cwd: '/home/meno/videofixer',
+    cwd: '/var/www/videofixer',
     // Must stay at 1 — the per-video encode lock (EncodeService's in-process
     // Set) is not shared across cluster workers, so cluster mode would
     // silently break the "one fix at a time per video" guarantee.
